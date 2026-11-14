@@ -66,12 +66,14 @@ class Arm:
         connect_manipulation_on_init: bool,
         group_name: str = "arm",
     ) -> None:
-        _ros_wrapper.init_action_server(
+        self._namespace = namespace
+        # this robot's own action clients: a Robot built later for another namespace does not take them over
+        self._channel = _ros_wrapper.init_action_server(
             namespace,
             {
                 _ros_wrapper.get_moveit_topic_name(): (
                     MoveItMacroAction,
-                    _ros_wrapper.launch_moveit_macros_command(),
+                    _ros_wrapper.launch_moveit_macros_command(namespace),
                     self.ROSLAUNCH_SLEEP_DURATION,
                 ),
                 _ros_wrapper.get_ft_observer_topic_name(): (FtObserverAction,),
@@ -96,11 +98,11 @@ class Arm:
 
     def _get_pose_joint_values(self) -> Dict[str, Dict[str, float]]:
         """Get joint values from semantic robot description parameter used for arm poses."""
-        params = _ros_wrapper.list_params(_ros_wrapper._namespace)
+        params = _ros_wrapper.list_params(self._namespace)
         # If default param name exists, use it.
-        if _ros_wrapper._namespace + self.ROBOT_DESCRIPTION_SEMANTIC in params:
+        if self._namespace + self.ROBOT_DESCRIPTION_SEMANTIC in params:
             param = _ros_wrapper.get_param(
-                _ros_wrapper._namespace + self.ROBOT_DESCRIPTION_SEMANTIC
+                self._namespace + self.ROBOT_DESCRIPTION_SEMANTIC
             )
         else:
             # Otherwise search for param which ends with '_semantic',
@@ -138,7 +140,7 @@ class Arm:
          Return the moveit_macro action server's result.
         If done_cb is given, make this an asynchronous action and call done_cb() when done.
         """
-        if not _ros_wrapper._connect_to_action_server(
+        if not self._channel._connect_to_action_server(
             _ros_wrapper.get_moveit_topic_name()
         ):
             _ros_wrapper.log(
@@ -151,9 +153,9 @@ class Arm:
         goal.type = goal_type
         goal.name = goal_name
         return (
-            _ros_wrapper.send_goal_and_wait(_ros_wrapper.get_moveit_topic_name(), goal)
+            self._channel.send_goal_and_wait(_ros_wrapper.get_moveit_topic_name(), goal)
             if done_cb is None
-            else _ros_wrapper.send_goal(
+            else self._channel.send_goal(
                 _ros_wrapper.get_moveit_topic_name(), goal, done_cb
             )
         )
@@ -186,7 +188,7 @@ class Arm:
         Call force torque observer with given threshold and timeout.
          Return whether successful.
         """
-        if not _ros_wrapper._connect_to_action_server(
+        if not self._channel._connect_to_action_server(
             _ros_wrapper.get_ft_observer_topic_name()
         ):
             _ros_wrapper.log("Did you launch the ft_observer node?", level="error")
@@ -195,7 +197,7 @@ class Arm:
         goal = FtObserverGoal()
         goal.threshold = threshold
         goal.timeout = timeout
-        result = _ros_wrapper.send_goal_and_wait(
+        result = self._channel.send_goal_and_wait(
             _ros_wrapper.get_ft_observer_topic_name(), goal, timeout
         )
         return result if result is not None else False
@@ -205,7 +207,7 @@ class Arm:
     ) -> Optional[str]:
         """Return the pose name if the robot arm is currently in one of the known poses."""
         joint_state: JointState = _ros_wrapper.wait_for_message(
-            _ros_wrapper._namespace + "joint_states", JointState, timeout
+            self._namespace + "joint_states", JointState, timeout
         )
         for pose_name, joints in self._pose_joint_values.items():
             for joint_name, value in joints.items():
@@ -221,28 +223,30 @@ class Arm:
 
 class Gripper:
     def __init__(self, namespace: str, connect_manipulation_on_init: bool = False):
-        _ros_wrapper.init_action_server(
+        self._namespace = namespace
+        # this robot's own action clients: a Robot built later for another namespace does not take them over
+        self._channel = _ros_wrapper.init_action_server(
             namespace,
             {_ros_wrapper.get_gripper_topic_name(): (GripperCommandAction,)},
             connect_manipulation_on_init,
         )
 
     def open(self):
-        if _ros_wrapper.get_gripper_topic_name() not in _ros_wrapper._action_clients:
-            _ros_wrapper._connect_to_action_server(
+        if self._channel.get_action_client(_ros_wrapper.get_gripper_topic_name()) is None:
+            self._channel._connect_to_action_server(
                 _ros_wrapper.get_gripper_topic_name()
             )
-        _ros_wrapper.send_goal_and_wait(
+        self._channel.send_goal_and_wait(
             _ros_wrapper.get_gripper_topic_name(),
             _ros_wrapper.create_open_gripper_goal(),
         )
 
     def close(self):
-        if _ros_wrapper.get_gripper_topic_name() not in _ros_wrapper._action_clients:
-            _ros_wrapper._connect_to_action_server(
+        if self._channel.get_action_client(_ros_wrapper.get_gripper_topic_name()) is None:
+            self._channel._connect_to_action_server(
                 _ros_wrapper.get_gripper_topic_name()
             )
-        _ros_wrapper.send_goal_and_wait(
+        self._channel.send_goal_and_wait(
             _ros_wrapper.get_gripper_topic_name(),
             _ros_wrapper.create_close_gripper_goal(),
         )

@@ -44,7 +44,8 @@ class Base:
 
     def __init__(self, namespace: str, connect_navigation_on_init: bool) -> None:
         self._namespace = namespace
-        _ros_wrapper.init_action_server(
+        # this robot's own action clients: a Robot built later for another namespace does not take them over
+        self._channel = _ros_wrapper.init_action_server(
             namespace,
             {_ros_wrapper.get_move_base_topic_name(): (MoveBaseAction,)},
             connect_navigation_on_init,
@@ -127,7 +128,7 @@ class Base:
         Move robot to goal with timeout. Return the move_base action server's result.
         If done_cb is given, make this an asynchronous action and call done_cb() when done.
         """
-        if not _ros_wrapper._connect_to_action_server(
+        if not self._channel._connect_to_action_server(
             _ros_wrapper.get_move_base_topic_name()
         ):
             _ros_wrapper.log("Did you launch the move_base node?", level="error")
@@ -150,11 +151,11 @@ class Base:
                 f"Waiting for navigation result with timeout of {timeout} s ...",
                 level="debug",
             )
-            return _ros_wrapper.send_goal_and_wait(
+            return self._channel.send_goal_and_wait(
                 _ros_wrapper.get_move_base_topic_name(), goal, timeout
             )
         else:
-            return _ros_wrapper.send_goal(
+            return self._channel.send_goal(
                 _ros_wrapper.get_move_base_topic_name(), goal, done_cb
             )
 
@@ -250,16 +251,16 @@ class Base:
             return None
         server_name = self.MOVE_LINEAR_TOPIC_NAME
         _ros_wrapper._server_specs.setdefault(server_name, (MoveLinearAction,))
-        if not _ros_wrapper._connect_to_action_server(server_name, timeout=2.0):
+        if not self._channel._connect_to_action_server(server_name, timeout=2.0):
             _ros_wrapper.log("Did you launch the move_linear node?", level="error")
             return None
         _ros_wrapper.log(f"Moving base {distance_cm:+.1f} cm along its heading ...", level="info")
-        state = _ros_wrapper.send_goal_and_wait(
+        state = self._channel.send_goal_and_wait(
             server_name,
             MoveLinearGoal(distance_cm=float(distance_cm), timeout_s=float(timeout)),
             timeout + 5.0,
         )
-        result = _ros_wrapper.get_action_result(server_name)
+        result = self._channel.get_action_result(server_name)
         if result is None:
             _ros_wrapper.log(f"No move_linear result (state {state}).", level="error")
             return None

@@ -3,7 +3,7 @@ import os
 import shlex
 import subprocess
 import time
-from threading import Event
+from threading import Event, Lock
 from abc import ABC, abstractmethod
 from typing import Optional, List, Tuple, Any, Dict, TypeVar, Generic, Union
 
@@ -25,7 +25,6 @@ try:
         from rclpy.node import Node
         from rclpy.action import ActionClient
         from rclpy.duration import Duration
-        from rclpy.client import Future
         from tf_transformations import euler_from_quaternion, quaternion_from_euler
         from tf2_ros import TransformListener, Buffer
         from nav2_msgs.action import NavigateToPose
@@ -41,7 +40,81 @@ except KeyError:
 T = TypeVar("T")
 
 
+class ActionChannel:
+    """The action clients of one robot namespace. Every Base, Arm and Gripper of that namespace uses the same channel,
+    so several robots in one process each reach their own action servers, whichever robot was built last."""
+
+    def __init__(self, wrapper: "RosWrapperInterface", namespace: str) -> None:
+        self._wrapper = wrapper
+        self.namespace = namespace
+        self._action_clients: Dict[str, Any] = {}
+        self._last_server_name: Optional[str] = None
+        self._server_specs: Dict[str, Union[Tuple[Generic[T]], Tuple[Generic[T], str, int]]] = {}
+
+    def _connect_to_action_server(self, server_name: str, timeout: float = 0.0) -> bool:
+        return self._wrapper._connect_to_action_server(server_name, timeout, namespace=self.namespace)
+
+    def _has_action_result(self, server_name: str) -> bool:
+        return self._wrapper._has_action_result(server_name, namespace=self.namespace)
+
+    def send_goal_and_wait(self, server_name: str, goal: T, timeout: float = 60.0) -> Any:
+        return self._wrapper.send_goal_and_wait(server_name, goal, timeout, namespace=self.namespace)
+
+    def send_goal(self, server_name: str, goal: T, done_cb: Any) -> Any:
+        return self._wrapper.send_goal(server_name, goal, done_cb, namespace=self.namespace)
+
+    def get_action_result(self, server_name: Optional[str] = None) -> Any:
+        return self._wrapper.get_action_result(server_name, namespace=self.namespace)
+
+    def get_action_client(self, server_name: str) -> Any:
+        return self._wrapper.get_action_client(server_name, namespace=self.namespace)
+
+
 class RosWrapperInterface(ABC):
+    _namespace: str = ""
+
+    def channel(self, namespace: Optional[str] = None) -> ActionChannel:
+        """the action channel of `namespace`, made on first use; None: the namespace of the robot built last"""
+        if namespace is None:
+            namespace = self._namespace
+        channels = self.__dict__.get("_channels")
+        if channels is None:
+            channels = self.__dict__.setdefault("_channels", {})
+        with _CHANNELS_LOCK:
+            channel = channels.get(namespace)
+            if channel is None:
+                channel = channels[namespace] = ActionChannel(self, namespace)
+        return channel
+
+    # The action clients and last server of the robot built last: what these attributes held before there was one
+    # channel per namespace (read by code that reaches into the wrapper).
+    @property
+    def _action_clients(self) -> Dict[str, Any]:
+        return self.channel()._action_clients
+
+    @property
+    def _last_server_name(self) -> Optional[str]:
+        return self.channel()._last_server_name
+
+    def _server_spec(self, channel: ActionChannel, server_name: str):
+        """the channel's own spec (it may carry a launch command for its namespace), else the shared one"""
+        spec = channel._server_specs.get(server_name)
+        return spec if spec is not None else self._server_specs[server_name]
+
+    def _register_action_servers(self, namespace, server_specs) -> ActionChannel:
+        assert (
+            server_specs
+        ), "Error: You must init an action server with an item in server_specs."
+        self._namespace = namespace
+        self._server_specs.update(server_specs)
+        channel = self.channel(namespace)
+        channel._server_specs.update(server_specs)
+        return channel
+
+    def get_action_client(self, server_name: str, namespace: Optional[str] = None) -> Any:
+        """the action client of `server_name` in `namespace` (None: the robot built last), None before it connected"""
+        return self.channel(namespace)._action_clients.get(server_name)
+
     @abstractmethod
     def _init_node(self):
         pass
@@ -55,15 +128,19 @@ class RosWrapperInterface(ABC):
         pass
 
     @abstractmethod
-    def get_action_result(self, server_name: Optional[str] = None) -> Any:
+    def get_action_result(
+        self, server_name: Optional[str] = None, namespace: Optional[str] = None
+    ) -> Any:
         pass
 
     @abstractmethod
-    def _connect_to_action_server(self, server_name: str, timeout: float = 0.0) -> bool:
+    def _connect_to_action_server(
+        self, server_name: str, timeout: float = 0.0, namespace: Optional[str] = None
+    ) -> bool:
         pass
 
     @abstractmethod
-    def _has_action_result(self, server_name: str) -> bool:
+    def _has_action_result(self, server_name: str, namespace: Optional[str] = None) -> bool:
         pass
 
     @abstractmethod
@@ -76,10 +153,6 @@ class RosWrapperInterface(ABC):
         pass
 
     @abstractmethod
-    def get_action_result(self, server_name: Optional[str] = None) -> Any:
-        pass
-
-    @abstractmethod
     def lookup_transform(
         self, target_frame: str, source_frame: str, time: Any
     ) -> Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]:
@@ -87,12 +160,14 @@ class RosWrapperInterface(ABC):
 
     @abstractmethod
     def send_goal_and_wait(
-        self, server_name: str, goal: T, timeout: float = 60.0
+        self, server_name: str, goal: T, timeout: float = 60.0, namespace: Optional[str] = None
     ) -> Any:
         pass
 
     @abstractmethod
-    def send_goal(self, server_name: str, goal: T, done_cb: Any) -> None:
+    def send_goal(
+        self, server_name: str, goal: T, done_cb: Any, namespace: Optional[str] = None
+    ) -> None:
         pass
 
     @abstractmethod
@@ -144,7 +219,7 @@ class RosWrapperInterface(ABC):
         pass
 
     @abstractmethod
-    def launch_moveit_macros_command(self) -> str:
+    def launch_moveit_macros_command(self, namespace: Optional[str] = None) -> str:
         pass
 
     def euler_from_quaternion(
@@ -186,10 +261,7 @@ class Ros1Wrapper(RosWrapperInterface):
     MOVEIT_TOPIC_NAME = "moveit_macros"
     FT_OBSERVER_TOPIC_NAME = "ft_observer"
     GRIPPER_TOPIC_NAME = "gripper_hw"
-    _namespace: str = ""
     _server_specs: Dict[str, Union[Tuple[Generic[T]], Tuple[Generic[T], str, int]]] = {}
-    _action_clients: Dict[str, actionlib.SimpleActionClient] = {}
-    _last_server_name: Optional[str] = None
     _tf_listener: Optional[tf.TransformListener] = None
 
     def _init_node(self) -> None:
@@ -236,67 +308,70 @@ class Ros1Wrapper(RosWrapperInterface):
         namespace: str,
         server_specs: Dict[str, Union[Tuple[Generic[T]], Tuple[Generic[T], str, int]]],
         connect_on_init: bool = False,
-    ):
-        self._namespace = namespace
-        assert (
-            server_specs
-        ), "Error: You must init an ActionlibComponent with an item in server_specs."
-        self._server_specs.update(server_specs)
-        self._action_clients: Dict[str, actionlib.SimpleActionClient] = {}
-        self._last_server_name: Optional[str] = None
+    ) -> ActionChannel:
+        channel = self._register_action_servers(namespace, server_specs)
         if connect_on_init:
             for server_name in server_specs.keys():
-                self._connect_to_action_server(server_name)
+                self._connect_to_action_server(server_name, namespace=namespace)
+        return channel
 
-    def _has_action_result(self, server_name: str) -> bool:
+    def _has_action_result(self, server_name: str, namespace: Optional[str] = None) -> bool:
         return self._is_topic_with_suffix(
-            self._namespace, server_name + "/result", "Result"
+            self.channel(namespace).namespace, server_name + "/result", "Result"
         )
 
-    def _connect_to_action_server(self, server_name: str, timeout: float = 0.0) -> bool:
-        self._last_server_name = server_name
-        if server_name not in self._action_clients:
-            server_spec = self._server_specs[server_name]
-            if not self._has_action_result(server_name):
+    def _connect_to_action_server(
+        self, server_name: str, timeout: float = 0.0, namespace: Optional[str] = None
+    ) -> bool:
+        channel = self.channel(namespace)
+        channel._last_server_name = server_name
+        if server_name not in channel._action_clients:
+            server_spec = self._server_spec(channel, server_name)
+            if not self._has_action_result(server_name, namespace=channel.namespace):
                 if len(server_spec) == 3:
                     self._execute(*server_spec[1:])
-                if not self._has_action_result(server_name):
-                    rospy.logerr(f"Server '{server_name}' not found by topic.")
+                if not self._has_action_result(server_name, namespace=channel.namespace):
+                    rospy.logerr(f"Server '{channel.namespace}{server_name}' not found by topic.")
                     return False
             action_client = actionlib.SimpleActionClient(
-                self._namespace + server_name, server_spec[0]
+                channel.namespace + server_name, server_spec[0]
             )
             if not action_client.wait_for_server(timeout=Duration(timeout)):
                 rospy.logerr(
                     f"Timeout while trying to connect to server '{server_name}'.{' ROS is shutting down.' if rospy.is_shutdown() else ''}"
                 )
                 return False
-            self._action_clients[server_name] = action_client
+            channel._action_clients[server_name] = action_client
         return True
 
     def send_goal_and_wait(
-        self, server_name: str, goal: T, timeout: float = 60.0
+        self, server_name: str, goal: T, timeout: float = 60.0, namespace: Optional[str] = None
     ) -> Any:
-        return self._action_clients[server_name].send_goal_and_wait(
+        return self.channel(namespace)._action_clients[server_name].send_goal_and_wait(
             goal, Duration(timeout)
         )
 
-    def send_goal(self, server_name: str, goal: T, done_cb: Any) -> None:
-        self._action_clients[server_name].send_goal(goal, done_cb)
+    def send_goal(
+        self, server_name: str, goal: T, done_cb: Any, namespace: Optional[str] = None
+    ) -> None:
+        self.channel(namespace)._action_clients[server_name].send_goal(goal, done_cb)
 
     def get_pose_from_goal(self, goal: Any) -> Tuple[List[float], List[float]]:
         return goal.target_pose.pose
 
-    def get_action_result(self, server_name: Optional[str] = None) -> Any:
+    def get_action_result(
+        self, server_name: Optional[str] = None, namespace: Optional[str] = None
+    ) -> Any:
+        channel = self.channel(namespace)
         if server_name is None:
-            server_name = self._last_server_name
+            server_name = channel._last_server_name
             if server_name is None:
                 rospy.logerr("Cannot get result before connecting to any server.")
                 return None
-        if server_name not in self._action_clients:
+        if server_name not in channel._action_clients:
             rospy.logerr(f"Cannot get result from server '{server_name}'.")
             return None
-        return self._action_clients[server_name].get_result()
+        return channel._action_clients[server_name].get_result()
 
     def lookup_transform(
         self, reference_frame: str, source_frame: str, time: int = 0
@@ -351,8 +426,9 @@ class Ros1Wrapper(RosWrapperInterface):
     def get_param(self, param_name: str):
         return rosparam.get_param(param_name)
 
-    def launch_moveit_macros_command(self) -> str:
-        return f"roslaunch robot_api moveit_macros.launch namespace:='{self._namespace.strip('/')}'"
+    def launch_moveit_macros_command(self, namespace: Optional[str] = None) -> str:
+        namespace = self._namespace if namespace is None else namespace
+        return f"roslaunch robot_api moveit_macros.launch namespace:='{namespace.strip('/')}'"
 
     def get_moveit_topic_name(self) -> str:
         return self.MOVEIT_TOPIC_NAME
@@ -372,8 +448,9 @@ class Ros1Wrapper(RosWrapperInterface):
     def get_param(self, param_name: str):
         return rosparam.get_param(param_name)
 
-    def launch_moveit_macros_command(self) -> str:
-        return f"roslaunch robot_api moveit_macros.launch namespace:='{self._namespace.strip('/')}'"
+    def launch_moveit_macros_command(self, namespace: Optional[str] = None) -> str:
+        namespace = self._namespace if namespace is None else namespace
+        return f"roslaunch robot_api moveit_macros.launch namespace:='{namespace.strip('/')}'"
 
 
 class Ros2Wrapper(RosWrapperInterface):
@@ -382,10 +459,7 @@ class Ros2Wrapper(RosWrapperInterface):
     FT_OBSERVER_TOPIC_NAME = "ft_observer"
     GRIPPER_TOPIC_NAME = "robotiq_gripper_controller/gripper_cmd"
     _ros_node: Optional[Node] = None
-    _namespace: str = ""
     _server_specs: Dict[str, Union[Tuple[Generic[T]], Tuple[Generic[T], str, int]]] = {}
-    _action_clients: Dict[str, List[ActionClient, Future]] = {}
-    _last_server_name: Optional[str] = None
     _tf_listener: Optional[TransformListener] = None
     _tf_buffer: Optional[Buffer] = None
 
@@ -442,44 +516,45 @@ class Ros2Wrapper(RosWrapperInterface):
         node = self._init_node()
         return node.get_topic_names_and_types()
 
-    def get_action_result(self, server_name: Optional[str] = None) -> Any:
+    def get_action_result(
+        self, server_name: Optional[str] = None, namespace: Optional[str] = None
+    ) -> Any:
         node = self._init_node()
+        channel = self.channel(namespace)
         if server_name is None:
-            server_name = self._last_server_name
+            server_name = channel._last_server_name
             if server_name is None:
                 self.log(
                     "Cannot get result before connecting to any server.", level="error"
                 )
                 return None
-        if server_name not in self._action_clients:
+        if server_name not in channel._action_clients:
             self.log(f"Cannot get result from server '{server_name}'.", level="error")
             return None
-        return self._action_clients[server_name][1].result()
+        return channel._action_clients[server_name][1].result()
 
     def init_action_server(
         self,
         namespace: str,
         server_specs: Dict[str, Union[Tuple[Generic[T]], Tuple[Generic[T], str, int]]],
         connect_on_init: bool = False,
-    ):
-        self._namespace = namespace
-        assert (
-            server_specs
-        ), "Error: You must init an action server with an item in server_specs."
-        self._server_specs.update(server_specs)
-        self._action_clients: Dict[str, List[ActionClient, Future]] = {}
-        self._last_server_name: Optional[str] = None
+    ) -> ActionChannel:
+        channel = self._register_action_servers(namespace, server_specs)
         if connect_on_init:
             for server_name in server_specs.keys():
-                self._connect_to_action_server(server_name)
+                self._connect_to_action_server(server_name, namespace=namespace)
+        return channel
 
-    def _connect_to_action_server(self, server_name: str, timeout: float = 0.0) -> bool:
+    def _connect_to_action_server(
+        self, server_name: str, timeout: float = 0.0, namespace: Optional[str] = None
+    ) -> bool:
         node = self._init_node()
-        self._last_server_name = server_name
-        if server_name not in self._action_clients:
-            server_spec = self._server_specs[server_name]
+        channel = self.channel(namespace)
+        channel._last_server_name = server_name
+        if server_name not in channel._action_clients:
+            server_spec = self._server_spec(channel, server_name)
             action_client = ActionClient(
-                node, server_spec[0], self._namespace + server_name
+                node, server_spec[0], channel.namespace + server_name
             )
             if (
                 not action_client.wait_for_server(timeout_sec=0.0)
@@ -492,13 +567,17 @@ class Ros2Wrapper(RosWrapperInterface):
                     level="error",
                 )
                 return False
-            self._action_clients[server_name] = [action_client, None]
+            channel._action_clients[server_name] = [action_client, None]
         return True
 
-    def _has_action_result(self, server_name: str) -> bool:
+    def _has_action_result(self, server_name: str, namespace: Optional[str] = None) -> bool:
         return self._is_topic_with_suffix(
-            self._namespace, server_name + "/_action/get_result", "Result"
+            self.channel(namespace).namespace, server_name + "/_action/get_result", "Result"
         )
+
+    def get_action_client(self, server_name: str, namespace: Optional[str] = None) -> Any:
+        entry = self.channel(namespace)._action_clients.get(server_name)
+        return entry[0] if entry is not None else None
 
     def lookup_transform(
         self, reference_frame: str, source_frame: str, time: int = 0
@@ -512,9 +591,9 @@ class Ros2Wrapper(RosWrapperInterface):
         )
 
     def send_goal_and_wait(
-        self, server_name: str, goal: T, timeout: float = 60.0
+        self, server_name: str, goal: T, timeout: float = 60.0, namespace: Optional[str] = None
     ) -> Any:
-        send_goal_future = self._action_clients[server_name][0].send_goal_async(goal)
+        send_goal_future = self.channel(namespace)._action_clients[server_name][0].send_goal_async(goal)
         rclpy.spin_until_future_complete(
             self._ros_node, send_goal_future, timeout_sec=timeout / 2.0
         )
@@ -540,11 +619,14 @@ class Ros2Wrapper(RosWrapperInterface):
 
         return result_future.result()
 
-    def send_goal(self, server_name: str, goal: T, done_cb: Any) -> None:
-        send_goal_future = self._action_clients[server_name][0].send_goal_async(goal)
+    def send_goal(
+        self, server_name: str, goal: T, done_cb: Any, namespace: Optional[str] = None
+    ) -> None:
+        clients = self.channel(namespace)._action_clients
+        send_goal_future = clients[server_name][0].send_goal_async(goal)
 
         send_goal_future.add_done_callback(done_cb)
-        self._action_clients[server_name][1] = send_goal_future
+        clients[server_name][1] = send_goal_future
         return send_goal_future
 
     def get_pose_from_goal(self, goal: Any) -> Tuple[List[float], List[float]]:
@@ -639,12 +721,14 @@ class Ros2Wrapper(RosWrapperInterface):
     def get_param(self, param_name: str):
         return self._ros_node.get_parameter(param_name).get_parameter_value()
 
-    def launch_moveit_macros_command(self) -> str:
-        if self._namespace == "" or self._namespace == "/":
+    def launch_moveit_macros_command(self, namespace: Optional[str] = None) -> str:
+        namespace = self._namespace if namespace is None else namespace
+        if namespace == "" or namespace == "/":
             return "ros2 launch robot_api moveit_macros_ros2.launch.py"
-        return f"ros2 launch robot_api moveit_macros_ros2.launch.py namespace:='{self._namespace.strip('/')}'"
+        return f"ros2 launch robot_api moveit_macros_ros2.launch.py namespace:='{namespace.strip('/')}'"
 
 
+_CHANNELS_LOCK = Lock()
 _ros_wrapper: RosWrapperInterface = None
 
 
